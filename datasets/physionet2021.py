@@ -1,0 +1,298 @@
+# -*- coding: utf-8 -*-
+import json
+import math
+import os
+import random
+import re
+from multiprocessing import Pool
+
+import torch
+import wfdb
+from scipy import signal
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
+from helper_code import *
+# from team_code import *
+
+
+__all__ = ["PhysioNet2021Dataset"]
+
+
+class PhysioNet2021Dataset(Dataset):
+    """PhysioNet 2021 Challenge Dataset.
+    """
+
+    BASE_FS = 500
+#     LABELS = ("AF", "I-AVB", "LBBB", "Normal", "PAC", "PVC", "RBBB", "STD", "STE")
+#     SEX = ("Male", "Female")
+    twelve_leads = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+    six_leads = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF')
+    three_leads = ('I', 'II', 'V2')
+    two_leads = ('II', 'V5')
+
+    
+    def __init__(
+        self,
+        data_dir,
+        fs=BASE_FS,
+        max_seq_len=4096,
+        ensure_equal_len=True,
+        proc=None,
+        records=None,
+        simple_test=False,
+        leads = twelve_leads
+    ):
+        """Initialize the PhysioNet 2021 Challenge Dataset
+        data_dir: path to *.mat and *.hea files
+        fs: Sampling frequency to return tensors as (default: 500 samples per second)
+        max_seq_len: Maximum length of returned tensors (default: full signal length)
+        ensure_equal_len: if True, set all signal lengths equal to ensure_equal_len
+        proc: Number of processes for generating dataset length references (0: single threaded)
+        records: only use provided record names (default: use all available records)
+        """
+        super(PhysioNet2021Dataset, self).__init__()
+
+        if proc is None:
+            try:
+                proc = len(os.sched_getaffinity(0))
+            except Exception:
+                proc = 0
+
+        self.data_dir = data_dir
+        self.fs = fs
+        self.max_seq_len = max_seq_len
+        self.proc = proc
+        self.ensure_equal_len = ensure_equal_len
+        self.leads = leads # control the lead index
+        if ensure_equal_len:
+            assert (
+                self.max_seq_len is not None
+            ), "Cannot ensure equal lengths on unbounded sequences"
+
+        self.record_len_fs = {}  # length and fs of each record (sample size)
+        self.record_samps = {}  # number of max_seq_len segments per record
+        self.idx_to_key_rel = {}  # dataset index to record key
+
+        record_names = []
+        for f in os.listdir(self.data_dir):
+            if (
+                os.path.isfile(os.path.join(self.data_dir, f))
+                and not f.lower().startswith(".")
+                and f.lower().endswith(".hea")
+            ):
+                r_name = f[:-4]  # trim off .hea
+                if records is not None and r_name not in records:
+                    continue
+                else:
+                    record_names.append(r_name)
+        self.record_names = tuple(sorted(record_names))
+        self.num_classes, self.num_recordings, self.classes = self.get_label_classes()
+
+        if simple_test:
+            idx = 0
+            for rn in self.record_names:
+#             for idx in range(self.num_recordings):
+                self.idx_to_key_rel[idx] = (rn, 0)
+        else:
+            self.initialize_length_references()
+
+    def __len__(self):
+        return sum(self.record_samps.values())
+#         return self.num_recordings
+
+    def initialize_length_references(self):
+        # construt the dataset length references
+        if self.proc <= 0:
+            self.record_len_fs = dict(
+                PhysioNet2021Dataset._get_sig_len_fs(os.path.join(self.data_dir, rn))
+                for rn in self.record_names
+            )
+        else:
+            with Pool(self.proc) as p:
+                self.record_len_fs = dict(
+                    p.imap_unordered(
+                        PhysioNet2021Dataset._get_sig_len_fs,
+                        [os.path.join(self.data_dir, rn) for rn in self.record_names],
+                    )
+                )
+
+        # store the lengths and sample counts for each of the records
+        for rn in self.record_names:
+            len_rn, fs_rn = self.record_len_fs[rn]
+            if self.fs != fs_rn:
+                len_resamp = int(len_rn / fs_rn * self.fs)
+                self.record_len_fs[rn] = (len_resamp, self.fs)
+
+            if self.max_seq_len is None:
+                r_num_samples = 1
+            else:
+                r_num_samples = math.ceil(self.record_len_fs[rn][0] / self.max_seq_len)
+            r_start_idx = sum(self.record_samps.values())
+            r_end_idx = r_start_idx + max(r_num_samples, 0)
+            for idx in range(r_start_idx, r_end_idx):
+                self.idx_to_key_rel[idx] = (rn, idx - r_start_idx)
+            self.record_samps[rn] = r_num_samples
+
+    def __getitem__(self, index):
+#         'Generates one sample of data'
+        rn, rel_idx = self.idx_to_key_rel[index]
+
+#         print (index)
+        header = load_header(os.path.join(self.data_dir, rn+'.hea'))
+        recording = load_recording(os.path.join(self.data_dir, rn+'.mat'))
+        sig = recording.T  # shape SIGNAL, CHANNEL (e.g. 12, 7500)
+        sig = sig[:, [twelve_leads.index(lead) for lead in self.leads]]
+#         print ('sig.shape:', sig.shape)
+        # resample the signal if necessary
+        r = wfdb.rdrecord(os.path.join(self.data_dir, rn))
+        if self.fs != r.fs:
+            sig = signal.resample(sig, self.record_len_fs[r_pth][0])
+
+        # offset by the relative index if necessary
+        if self.max_seq_len is None:
+            start_idx = 0
+            end_idx = len(sig)
+        else:
+            start_idx = self.max_seq_len * rel_idx
+            end_idx = min(len(sig), start_idx + self.max_seq_len)
+
+        # force shape matches ensure_equal_len if necessary
+        if self.ensure_equal_len:
+            # start to end must equal max_seq_len
+            sig = torch.FloatTensor(sig[end_idx - self.max_seq_len : end_idx])
+            if len(sig) < self.max_seq_len:
+                pad = self.max_seq_len - len(sig)
+                sig = torch.nn.functional.pad(sig, (0, 0, pad, 0), "constant", 0)
+        else:
+            sig = torch.FloatTensor(sig[start_idx:end_idx])
+
+        
+#         data = np.zeros((1, 14), dtype=np.float32) # 14 features: one feature for each lead, one feature for age, and one feature for sex
+        labels = np.zeros((self.num_classes), dtype=np.bool) # One-hot encoding of classes
+        
+        # Get age, sex and root mean square of the leads.
+        age, sex = self.get_features(header, recording)
+
+        current_labels = get_labels(header)
+        for label in current_labels:
+            if label in self.classes:
+                j = self.classes.index(label)
+                labels[j] = 1
+
+        return {
+            'sig': sig.T, 
+            'age': age, 
+            'sex': sex, 
+            'labels': labels,
+            'record_name': rn,
+        }
+
+    @staticmethod
+    def split_names(data_dir, train_ratio):
+        """Split all of the record names up into bins based on ratios
+        """
+        record_names = [
+            f[:-4]
+            for f in os.listdir(data_dir)
+            if (
+                os.path.isfile(os.path.join(data_dir, f))
+                and not f.lower().startswith(".")
+                and f.lower().endswith(".hea")
+            )
+        ]
+
+        total_records_len = len(record_names)
+        train_records_len = int(total_records_len * train_ratio)
+        val_records_len = total_records_len - train_records_len
+
+        train_records = tuple(random.sample(record_names, train_records_len))
+        val_records = tuple(t for t in record_names if t not in train_records)
+
+        return train_records, val_records
+
+    @staticmethod
+    def split_names_cv(data_dir, fold=5, val_offset=0):
+        """Split the record names up into n-fold cross validation tuples
+        fold: (int) number of cross validation sets (>= 2)
+        val_offset: (int) current validation offset (0 < fold)
+        """
+        assert fold >= 2, f"fold must be greater than or equal to 2, got {fold}"
+        assert (
+            val_offset >= 0 and val_offset < fold
+        ), f"val_offset must be between [0, {fold}), got {val_offset}"
+        record_names = sorted(
+            [
+                f[:-4]
+                for f in os.listdir(data_dir)
+                if (
+                    os.path.isfile(os.path.join(data_dir, f))
+                    and not f.lower().startswith(".")
+                    and f.lower().endswith(".hea")
+                )
+            ]
+        )
+
+        total_records_len = len(record_names)
+        val_records_len = math.ceil(total_records_len / fold)
+
+        val_s_idx = val_offset * val_records_len
+        val_e_idx = val_s_idx + val_records_len
+
+        val_records = tuple(record_names[val_s_idx:val_e_idx])
+        train_records = tuple(t for t in record_names if not t in val_records)
+
+        return train_records, val_records
+
+#     @staticmethod
+    def get_label_classes(self):
+        header_files, recording_files = find_challenge_files(self.data_dir)
+        num_recordings = len(recording_files)
+        classes = set()
+        for header_file in header_files:
+            header = load_header(header_file)
+            classes |= set(get_labels(header))
+        if all(is_integer(x) for x in classes):
+            classes = sorted(classes, key=lambda x: int(x)) # Sort classes numerically if numbers.
+        else:
+            classes = sorted(classes) # Sort classes alphanumerically otherwise.
+        num_classes = len(classes)
+        return num_classes, num_recordings, classes
+    
+    @staticmethod
+    def _get_sig_len_fs(rn):
+        r = wfdb.rdrecord(rn)
+        return r.record_name, (r.sig_len, r.fs)
+
+    @staticmethod
+    def collate_fn(batch, pad=0):
+        age = torch.stack(tuple(e["age"] for e in batch))
+        sex = torch.stack(tuple(e["sex"] for e in batch))
+        labels = torch.stack(tuple(e["labels"] for e in batch))
+        signals = tuple(e["sig"] for e in batch)
+#         signal_lens = tuple(len(e) for e in signals)
+        sig = pad_sequence(signals, padding_value=pad)
+
+        return {
+            "sig": sig,
+            "labels": labels,
+            "sex": sex,
+            "age": age,
+#             "len": signal_lens,
+        }
+
+    def get_features(self, header, recording):
+        # Extract age.
+        age = get_age(header)
+        if age is None:
+            age = float('nan')
+
+        # Extract sex. Encode as 0 for female, 1 for male, and NaN for other.
+        sex = get_sex(header)
+        if sex in ('Female', 'female', 'F', 'f'):
+            sex = 0
+        elif sex in ('Male', 'male', 'M', 'm'):
+            sex = 1
+        else:
+            sex = float('nan')
+
+        return age, sex
